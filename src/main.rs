@@ -1,6 +1,13 @@
 use eframe::egui;
 use anyhow::Result;
 use uuid::Uuid;
+use std::time::Instant;
+
+mod terminal;
+mod ai;
+
+use terminal::TerminalSession;
+use ai::GeminiClient;
 
 fn main() -> Result<()> {
     let options = eframe::NativeOptions {
@@ -40,6 +47,8 @@ pub struct TerminalTab {
     mode: AppMode,
     history: Vec<String>,
     ai_conversation: Vec<AiMessage>,
+    terminal_session: Option<TerminalSession>,
+    last_update: Instant,
 }
 
 #[derive(Clone)]
@@ -52,16 +61,25 @@ pub struct TerminalApp {
     tabs: Vec<TerminalTab>,
     active_tab: usize,
     show_ai_input: bool,
-    gemini_api_key: String,
+    gemini_client: Option<GeminiClient>,
+    rt: tokio::runtime::Runtime,
 }
 
 impl TerminalApp {
     fn new() -> Self {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+        
+        let gemini_client = std::env::var("GEMINI_API_KEY")
+            .ok()
+            .filter(|key| !key.is_empty())
+            .map(GeminiClient::new);
+        
         let mut app = Self {
             tabs: Vec::new(),
             active_tab: 0,
             show_ai_input: false,
-            gemini_api_key: std::env::var("GEMINI_API_KEY").unwrap_or_default(),
+            gemini_client,
+            rt,
         };
         
         // Create initial tab
@@ -70,14 +88,22 @@ impl TerminalApp {
     }
 
     fn add_new_tab(&mut self) {
+        let terminal_session = TerminalSession::new().ok();
+        
         let tab = TerminalTab {
             id: Uuid::new_v4(),
             title: format!("Terminal {}", self.tabs.len() + 1),
-            content: "Welcome to GPUI Multi-Page AI Terminal\n$ ".to_string(),
+            content: if terminal_session.is_some() {
+                "Real terminal session started...\n".to_string()
+            } else {
+                "Welcome to GPUI Multi-Page AI Terminal (Demo Mode)\n$ ".to_string()
+            },
             input: String::new(),
             mode: AppMode::Terminal,
             history: Vec::new(),
             ai_conversation: Vec::new(),
+            terminal_session,
+            last_update: Instant::now(),
         };
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
@@ -105,23 +131,30 @@ impl TerminalApp {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             match tab.mode {
                 AppMode::Terminal => {
-                    tab.content.push_str(&format!("{}\n", command));
-                    tab.history.push(command.clone());
-                    
-                    // Simple command simulation
-                    match command.trim() {
-                        "clear" => tab.content.clear(),
-                        "pwd" => tab.content.push_str("/home/user\n"),
-                        "ls" => tab.content.push_str("Documents  Downloads  Pictures  Videos\n"),
-                        cmd if cmd.starts_with("echo ") => {
-                            let text = &cmd[5..];
-                            tab.content.push_str(&format!("{}\n", text));
+                    if let Some(ref session) = tab.terminal_session {
+                        // Real terminal session
+                        if let Err(e) = session.write_input(&format!("{}\n", command)) {
+                            tab.content.push_str(&format!("Error writing to terminal: {}\n", e));
                         }
-                        _ => {
-                            tab.content.push_str(&format!("Command '{}' not found. This is a demo terminal.\n", command));
+                    } else {
+                        // Fallback demo mode
+                        tab.content.push_str(&format!("{}\n", command));
+                        tab.history.push(command.clone());
+                        
+                        match command.trim() {
+                            "clear" => tab.content.clear(),
+                            "pwd" => tab.content.push_str("/home/user\n"),
+                            "ls" => tab.content.push_str("Documents  Downloads  Pictures  Videos\n"),
+                            cmd if cmd.starts_with("echo ") => {
+                                let text = &cmd[5..];
+                                tab.content.push_str(&format!("{}\n", text));
+                            }
+                            _ => {
+                                tab.content.push_str(&format!("Command '{}' not found. This is a demo terminal.\n", command));
+                            }
                         }
+                        tab.content.push_str("$ ");
                     }
-                    tab.content.push_str("$ ");
                 }
                 AppMode::AiAsist => {
                     // Add user message
@@ -130,17 +163,44 @@ impl TerminalApp {
                         content: command.clone(),
                     });
                     
-                    // Simulate AI response (in real app, this would call Gemini API)
-                    let ai_response = if self.gemini_api_key.is_empty() {
-                        "AI Assistant: Please set GEMINI_API_KEY environment variable to enable AI features.".to_string()
+                    // Get AI response
+                    if let Some(ref client) = self.gemini_client {
+                        let client = client.clone();
+                        let context = tab.ai_conversation.clone();
+                        let question = command.clone();
+                        
+                        // Use the runtime to execute the async call
+                        let response = self.rt.block_on(async {
+                            client.ask_question(&question, &context).await
+                        });
+                        
+                        let ai_response = match response {
+                            Ok(response) => response,
+                            Err(e) => format!("AI Error: {}", e),
+                        };
+                        
+                        tab.ai_conversation.push(AiMessage {
+                            role: "assistant".to_string(),
+                            content: ai_response,
+                        });
                     } else {
-                        format!("AI Assistant: I understand you asked about '{}'. This is a simulated response. In the full implementation, this would connect to Gemini API.", command)
-                    };
-                    
-                    tab.ai_conversation.push(AiMessage {
-                        role: "assistant".to_string(),
-                        content: ai_response,
-                    });
+                        let ai_response = "AI Assistant: Please set GEMINI_API_KEY environment variable to enable AI features.".to_string();
+                        tab.ai_conversation.push(AiMessage {
+                            role: "assistant".to_string(),
+                            content: ai_response,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    
+    fn update_terminal_output(&mut self) {
+        for tab in &mut self.tabs {
+            if let Some(ref session) = tab.terminal_session {
+                // Check for new output every frame
+                while let Some(output) = session.read_output() {
+                    tab.content.push_str(&output);
                 }
             }
         }
@@ -149,6 +209,21 @@ impl TerminalApp {
 
 impl eframe::App for TerminalApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Update terminal output for all tabs
+        self.update_terminal_output();
+        
+        // Set dark theme similar to Zed
+        ctx.set_style({
+            let mut style = (*ctx.style()).clone();
+            style.visuals.dark_mode = true;
+            style.visuals.window_fill = egui::Color32::from_rgb(24, 24, 27); // Zed's dark background
+            style.visuals.panel_fill = egui::Color32::from_rgb(32, 32, 35);
+            style.visuals.extreme_bg_color = egui::Color32::from_rgb(16, 16, 18);
+            style.visuals.faint_bg_color = egui::Color32::from_rgb(40, 40, 43);
+            style.visuals.selection.bg_fill = egui::Color32::from_rgb(58, 73, 102);
+            style
+        });
+        
         // Handle keyboard shortcuts
         ctx.input(|i| {
             if i.modifiers.command && i.key_pressed(egui::Key::I) {
@@ -161,20 +236,23 @@ impl eframe::App for TerminalApp {
 
         // Top menu bar
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            ui.style_mut().visuals.button_frame = true;
+            ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 4.0);
+            
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("New Tab (Cmd+T)").clicked() {
+                    if ui.button("🆕 New Tab (Cmd+T)").clicked() {
                         self.add_new_tab();
                         ui.close_menu();
                     }
-                    if ui.button("Close Tab").clicked() && self.tabs.len() > 1 {
+                    if ui.button("❌ Close Tab").clicked() && self.tabs.len() > 1 {
                         self.close_tab(self.active_tab);
                         ui.close_menu();
                     }
                 });
                 
                 ui.menu_button("View", |ui| {
-                    if ui.button("Switch Mode (Cmd+I)").clicked() {
+                    if ui.button("🔄 Switch Mode (Cmd+I)").clicked() {
                         self.switch_mode();
                         ui.close_menu();
                     }
@@ -182,13 +260,13 @@ impl eframe::App for TerminalApp {
                 
                 ui.separator();
                 
-                // Current mode indicator
+                // Current mode indicator with better styling
                 if let Some(tab) = self.tabs.get(self.active_tab) {
-                    let mode_text = match tab.mode {
-                        AppMode::Terminal => "🖥️ Terminal Mode",
-                        AppMode::AiAsist => "🤖 AI Assistant Mode",
+                    let (mode_text, mode_color) = match tab.mode {
+                        AppMode::Terminal => ("🖥️ Terminal Mode", egui::Color32::from_rgb(100, 200, 100)),
+                        AppMode::AiAsist => ("🤖 AI Assistant Mode", egui::Color32::from_rgb(100, 150, 255)),
                     };
-                    ui.colored_label(egui::Color32::LIGHT_BLUE, mode_text);
+                    ui.colored_label(mode_color, mode_text);
                 }
             });
         });
@@ -244,6 +322,7 @@ impl eframe::App for TerminalApp {
                                         .code_editor()
                                         .desired_width(f32::INFINITY)
                                         .interactive(false)
+                                        .text_color(egui::Color32::from_rgb(200, 255, 200)) // Terminal green
                                 );
                             }
                             AppMode::AiAsist => {
@@ -251,13 +330,25 @@ impl eframe::App for TerminalApp {
                                 ui.separator();
                                 
                                 for message in &tab_ai_conversation {
-                                    let color = if message.role == "user" {
-                                        egui::Color32::LIGHT_BLUE
+                                    let (color, prefix) = if message.role == "user" {
+                                        (egui::Color32::from_rgb(100, 150, 255), "👤 You:")
                                     } else {
-                                        egui::Color32::LIGHT_GREEN
+                                        (egui::Color32::from_rgb(100, 255, 150), "🤖 Assistant:")
                                     };
                                     
-                                    ui.colored_label(color, format!("{}: {}", message.role, message.content));
+                                    ui.horizontal(|ui| {
+                                        ui.colored_label(color, prefix);
+                                    });
+                                    
+                                    ui.add_space(4.0);
+                                    
+                                    // Message content with word wrapping
+                                    ui.add(
+                                        egui::Label::new(&message.content)
+                                            .wrap()
+                                    );
+                                    
+                                    ui.add_space(8.0);
                                     ui.separator();
                                 }
                             }
@@ -304,13 +395,17 @@ impl eframe::App for TerminalApp {
                     }
                 });
                 
-                // Help text
+                // Help text with better styling
                 ui.separator();
-                ui.small(match tab_mode {
-                    AppMode::Terminal => "Terminal Mode - Type commands and press Enter. Try: pwd, ls, echo hello, clear",
-                    AppMode::AiAsist => "AI Assistant Mode - Ask questions and get AI-powered responses",
+                ui.horizontal(|ui| {
+                    ui.small(match tab_mode {
+                        AppMode::Terminal => "💡 Terminal Mode - Type commands and press Enter. Try: pwd, ls, echo hello, clear",
+                        AppMode::AiAsist => "💡 AI Assistant Mode - Ask questions and get AI-powered responses",
+                    });
                 });
-                ui.small("Press Cmd+I to switch modes, Cmd+T for new tab");
+                ui.horizontal(|ui| {
+                    ui.small("🔧 Press Cmd+I to switch modes, Cmd+T for new tab");
+                });
             });
         });
     }
